@@ -1,13 +1,24 @@
 import streamlit as st
-from trading_env import *
-from rl_agent import *
-from utils import *
+from rl_agent import train_rl_agent
+from utils import load_data, preprocess_data
 
+def main():
+    st.title("Reinforcement Learning Stock Trading App")
 
-st.title("RL Stock Trading App")
+    uploaded_file = st.file_uploader("Upload market data CSV file", type=["csv"])
 
-# You can add components like:
-# - load data
-# - create environment
-# - train agent
-# - evaluate
+    if uploaded_file:
+        raw_data = load_data(uploaded_file)
+        st.write("Raw Data:")
+        st.dataframe(raw_data)
+
+        processed_data = preprocess_data(raw_data)
+        st.write("Processed Data:")
+        st.dataframe(processed_data)
+
+        if st.button("Train RL Agent"):
+            train_rl_agent(processed_data)
+            st.success("Training Completed!")
+
+if __name__ == "__main__":
+    main()
