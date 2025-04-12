@@ -1,0 +1,967 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+get_ipython().system('pip install stable-baselines3')
+get_ipython().system('pip install git+https://github.com/AI4Finance-Foundation/FinRL.git')
+
+
+# In[ ]:
+
+
+get_ipython().system('pip install pandas_market_calendars')
+
+
+# In[ ]:
+
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+# In[ ]:
+
+
+from finrl.config import INDICATORS
+from finrl.meta.preprocessor.preprocessors import FeatureEngineer
+from finrl.meta.preprocessor.yahoodownloader import YahooDownloader
+import pandas as pd
+tickers = ["RELIANCE.NS", "INFY.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS",
+           "ADANIENT.NS", "PAYTM.NS", "ZOMATO.NS", "TATAMOTORS.NS"]
+benchmark_ticker = "^NSEI"  # NIFTY 50
+
+start_date = "2007-01-01"
+end_date = "2025-01-01"
+
+df_s = YahooDownloader(start_date=start_date, end_date=end_date, ticker_list=tickers).fetch_data()
+df_benchmark = YahooDownloader(start_date=start_date, end_date=end_date, ticker_list=[benchmark_ticker]).fetch_data()
+
+df = pd.merge(df_s, df_benchmark[['date', 'close']], on='date', suffixes=('', '_benchmark'))
+
+df
+fe = FeatureEngineer(
+    use_technical_indicator=True,
+    tech_indicator_list=INDICATORS,
+    use_turbulence=True
+)
+df = fe.preprocess_data(df)
+
+df
+
+
+# In[ ]:
+
+
+# Save the processed dataset to a CSV file
+csv_filename = "indian_stock_data_this.csv"
+df.to_csv(csv_filename, index=False)
+
+print(f"Data saved to {csv_filename}")
+
+
+# In[ ]:
+
+
+from __future__ import annotations
+
+from typing import List
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+matplotlib.use("Agg")
+
+# from stable_baselines3.common.logger import Logger, KVWriter, CSVOutputFormat
+
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        stock_dim: int,
+        hmax: int,
+        initial_amount: int,
+        num_stock_shares: list[int],
+        buy_cost_pct: list[float],
+        sell_cost_pct: list[float],
+        reward_scaling: float,
+        state_space: int,
+        action_space: int,
+        treynor_rate_learn: float,
+        drawdown_component_learn: float,
+        #diversification_component_learn: float,
+        cost_component_learn: float,
+        risk_component_learn: float,
+        return_component_learn: float,
+        tech_indicator_list: list[str],
+        turbulence_threshold=None,
+        risk_indicator_col="turbulence",
+        make_plots: bool = False,
+        print_verbosity=10,
+        day=0,
+        initial=True,
+        previous_state=[],
+        model_name="",
+        mode="",
+        iteration="",
+    ):
+        self.day = day
+        self.df = df
+        self.stock_dim = stock_dim
+        self.hmax = hmax
+        self.num_stock_shares = num_stock_shares
+        self.initial_amount = initial_amount  # get the initial cash
+        self.buy_cost_pct = buy_cost_pct
+        self.sell_cost_pct = sell_cost_pct
+        self.reward_scaling = reward_scaling
+        self.state_space = state_space
+        self.action_space = action_space
+        self.tech_indicator_list = tech_indicator_list
+        self.action_space = spaces.Box(low=-1, high=1, shape=(self.action_space,))
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.state_space,)
+        )
+
+        self.data = self._get_multi_stock_data()
+        # self.data = self.df.loc[self.day, :]
+
+        self.terminal = False
+        self.make_plots = make_plots
+        self.print_verbosity = print_verbosity
+        self.turbulence_threshold = turbulence_threshold
+        self.risk_indicator_col = risk_indicator_col
+        self.initial = initial
+        self.previous_state = previous_state
+        self.model_name = model_name
+        self.mode = mode
+        self.iteration = iteration
+        # initalize state
+        self.state = self._initiate_state()
+
+        # initialize reward
+        self.reward = 0
+        self.turbulence = 0
+        self.cost = 0
+        self.trades = 0
+        self.episode = 0
+        self.treynor_rate_learn = 0.2
+        self.drawdown_component_learn = 0.1
+        #self.diversification_component_learn = 0.1
+        self.cost_component_learn = 0.1
+        self.risk_component_learn = 0.2
+        self.return_component_learn = 0.5
+        # memorize all the total balance change
+        self.asset_memory = [
+            self.initial_amount
+            + np.sum(
+                np.array(self.num_stock_shares)
+                * np.array(self.state[1 : 1 + self.stock_dim])
+            )
+        ]  # the initial total asset is calculated by cash + sum (num_share_stock_i * price_stock_i)
+        self.rewards_memory = []
+        self.actions_memory = []
+        self.state_memory = (
+            []
+        )  # we need sometimes to preserve the state in the middle of trading process
+        self.date_memory = [self._get_date()]
+        #         self.logger = Logger('results',[CSVOutputFormat])
+        # self.reset()
+        self._seed()
+
+    def set_reward_weights(self, w_treynor, w_drawdown, w_cost, w_risk, w_return):
+        self.treynor_rate_learn = w_treynor
+        self.drawdown_component_learn = w_drawdown
+        self.diversification_component_learn = w_diverse
+        self.cost_component_learn = w_cost
+        self.risk_component_learn = w_risk
+        self.return_component_learn = w_return
+        return
+
+    def _sell_stock(self, index, action):
+        def _do_sell_normal():
+            if (
+                self.state[index + 2 * self.stock_dim + 1] != True
+            ):  # check if the stock is able to sell, for simlicity we just add it in techical index
+                # if self.state[index + 1] > 0: # if we use price<0 to denote a stock is unable to trade in that day, the total asset calculation may be wrong for the price is unreasonable
+                # Sell only if the price is > 0 (no missing data in this particular date)
+                # perform sell action based on the sign of the action
+                if self.state[index + self.stock_dim + 1] > 0:
+                    # Sell only if current asset is > 0
+                    sell_num_shares = min(
+                        abs(action), self.state[index + self.stock_dim + 1]
+                    )
+                    sell_amount = (
+                        self.state[index + 1]
+                        * sell_num_shares
+                        * (1 - self.sell_cost_pct[index])
+                    )
+                    # update balance
+                    self.state[0] += sell_amount
+
+                    self.state[index + self.stock_dim + 1] -= sell_num_shares
+                    self.cost += (
+                        self.state[index + 1]
+                        * sell_num_shares
+                        * self.sell_cost_pct[index]
+                    )
+                    self.trades += 1
+                else:
+                    sell_num_shares = 0
+            else:
+                sell_num_shares = 0
+
+            return sell_num_shares
+
+        # perform sell action based on the sign of the action
+        if self.turbulence_threshold is not None:
+            if self.turbulence >= self.turbulence_threshold:
+                if self.state[index + 1] > 0:
+                    # Sell only if the price is > 0 (no missing data in this particular date)
+                    # if turbulence goes over threshold, just clear out all positions
+                    if self.state[index + self.stock_dim + 1] > 0:
+                        # Sell only if current asset is > 0
+                        sell_num_shares = self.state[index + self.stock_dim + 1]
+                        sell_amount = (
+                            self.state[index + 1]
+                            * sell_num_shares
+                            * (1 - self.sell_cost_pct[index])
+                        )
+                        # update balance
+                        self.state[0] += sell_amount
+                        self.state[index + self.stock_dim + 1] = 0
+                        self.cost += (
+                            self.state[index + 1]
+                            * sell_num_shares
+                            * self.sell_cost_pct[index]
+                        )
+                        self.trades += 1
+                    else:
+                        sell_num_shares = 0
+                else:
+                    sell_num_shares = 0
+            else:
+                sell_num_shares = _do_sell_normal()
+        else:
+            sell_num_shares = _do_sell_normal()
+
+        return sell_num_shares
+
+    def _buy_stock(self, index, action):
+        def _do_buy():
+            if (
+                self.state[index + 2 * self.stock_dim + 1] != True
+            ):  # check if the stock is able to buy
+                # if self.state[index + 1] >0:
+                # Buy only if the price is > 0 (no missing data in this particular date)
+                available_amount = self.state[0] // (
+                    self.state[index + 1] * (1 + self.buy_cost_pct[index])
+                )  # when buying stocks, we should consider the cost of trading when calculating available_amount, or we may be have cash<0
+                # print('available_amount:{}'.format(available_amount))
+
+                # update balance
+                buy_num_shares = min(available_amount, action)
+                buy_amount = (
+                    self.state[index + 1]
+                    * buy_num_shares
+                    * (1 + self.buy_cost_pct[index])
+                )
+                self.state[0] -= buy_amount
+
+                self.state[index + self.stock_dim + 1] += buy_num_shares
+
+                self.cost += (
+                    self.state[index + 1] * buy_num_shares * self.buy_cost_pct[index]
+                )
+                self.trades += 1
+            else:
+                buy_num_shares = 0
+
+            return buy_num_shares
+
+        # perform buy action based on the sign of the action
+        if self.turbulence_threshold is None:
+            buy_num_shares = _do_buy()
+        else:
+            if self.turbulence < self.turbulence_threshold:
+                buy_num_shares = _do_buy()
+            else:
+                buy_num_shares = 0
+                pass
+
+        return buy_num_shares
+
+    def calculate_reward(self):
+        # Calculate return component
+        current_total_asset = self.state[0] + sum(
+            np.array(self.state[1 : (self.stock_dim + 1)])
+            * np.array(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
+        )
+        return_component = (self.asset_memory[-1] - self.asset_memory[-2])/self.asset_memory[-2]
+
+        # Convert memory to DataFrame
+        df_total_value = pd.DataFrame(self.asset_memory, columns=["account_value"])
+        df_total_value["date"] = self.date_memory
+        df_total_value["daily_return"] = df_total_value["account_value"].pct_change(1)
+
+        # Get benchmark values from the 'close_benchmark' column, but only for rows up to the length of asset_memory
+        df_total_value["benchmark_value"] = self.df["close_benchmark"].iloc[:len(df_total_value)].reset_index(drop=True)
+        df_total_value["benchmark_daily_return"] = df_total_value["benchmark_value"].pct_change(1)
+
+        # Calculate risk component (standard deviation of returns)
+        if len(self.asset_memory) > 1:
+            daily_returns = pd.Series(self.asset_memory).pct_change().dropna()
+            risk_component = -np.std(daily_returns) * 100  # Scale for learning
+        else:
+            risk_component = 0
+
+        # Calculate transaction cost component
+        cost_component = -self.cost * 0.1  # Scale for learning
+
+        # Calculate diversification component
+        if sum(np.abs(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])) == 0:
+            position_concentration = 0
+        else:
+            position_concentration = np.max(np.abs(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])) / sum(np.abs(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)]))
+        #diversification_component = -position_concentration * 100  # Scale for learning
+
+        # Calculate drawdown component
+        if len(self.asset_memory) > 0:
+            peak_value = np.max(self.asset_memory)
+            drawdown_component = -(peak_value - current_total_asset) / peak_value * 100  # Scale for learning
+        else:
+            drawdown_component = 0
+        #remove_nan = lambda x: 0 if np.isnan(x) else x
+
+        # Calculate portfolio returns and risks
+        mean_returns = df_total_value["daily_return"].mean()
+        std_returns = df_total_value["daily_return"].std()
+
+        # Calculate benchmark returns and risks
+        bench_returns = df_total_value["benchmark_daily_return"].mean()
+        bench_std = df_total_value["benchmark_daily_return"].std()
+
+        # Calculate beta
+        beta = 1.0  # default value
+        if bench_std and not np.isnan(bench_std) and bench_std != 0:
+            portfolio_returns = df_total_value["daily_return"].fillna(0)
+            benchmark_returns = df_total_value["benchmark_daily_return"].fillna(0)
+            if len(portfolio_returns) == len(benchmark_returns):
+                covariance = np.cov(portfolio_returns, benchmark_returns)[0][1]
+                beta = covariance / (bench_std ** 2)
+
+        treynor = 0
+        if beta and not np.isnan(beta) and beta != 0:
+            treynor = (252**0.5) * mean_returns / beta
+        # Combine components with weights
+        total_reward = (return_component * self.return_component_learn +
+                        risk_component * self.risk_component_learn +
+                        cost_component * self.cost_component_learn +
+                        #diversification_component * self.diversification_component_learn +
+                        drawdown_component * self.drawdown_component_learn
+                        +treynor*self.treynor_rate_learn)
+
+        self.previous_total_asset = current_total_asset
+        print(f"Treynor: {self.treynor_rate_learn}")
+        print(f"Drawdown: {self.drawdown_component_learn}")
+        #print(f"Diversification: {self.diversification_component_learn}")
+        print(f"Cost: {self.cost_component_learn}")
+        print(f"Risk: {self.risk_component_learn}")
+        print(f"Return: {self.return_component_learn}")
+
+        return total_reward
+
+    def _make_plot(self):
+        plt.plot(self.asset_memory, "r")
+        plt.savefig(f"results/account_value_trade_{self.episode}.png")
+        plt.close()
+
+    def reset(
+        self,
+        *,
+        seed=None,
+        options=None,
+    ):
+        # initiate state
+        self.day = 0
+        self.data = self.df.loc[self.day, :]
+        self.state = self._initiate_state()
+
+        if self.initial:
+            self.asset_memory = [
+                self.initial_amount
+                + np.sum(
+                    np.array(self.num_stock_shares)
+                    * np.array(self.state[1 : 1 + self.stock_dim])
+                )
+            ]
+        else:
+            previous_total_asset = self.previous_state[0] + sum(
+                np.array(self.state[1 : (self.stock_dim + 1)])
+                * np.array(
+                    self.previous_state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)]
+                )
+            )
+            self.asset_memory = [previous_total_asset]
+
+        self.turbulence = 0
+        self.cost = 0
+        self.trades = 0
+        self.terminal = False
+        # self.iteration=self.iteration
+        self.rewards_memory = []
+        self.actions_memory = []
+        self.date_memory = [self._get_date()]
+
+        self.episode += 1
+
+        return self.state, {}
+
+    def render(self, mode="human", close=False):
+        return self.state
+
+    def _initiate_state(self):
+        if self.initial:
+            # For Initial State
+            if len(self.df.tic.unique()) > 1:
+                self.data = self._get_multi_stock_data()
+                # for multiple stock
+                state = (
+                    [self.initial_amount]
+                    + self.data.close.values.tolist()
+                    + self.num_stock_shares
+                    + sum(
+                        (
+                            self.data[tech].values.tolist()
+                            for tech in self.tech_indicator_list
+                        ),
+                        [],
+                    )
+                )  # append initial stocks_share to initial state, instead of all zero
+            else:
+                # for single stock
+                state = (
+                    [self.initial_amount]
+                    + [self.data.close]
+                    + [0] * self.stock_dim
+                    + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+                )
+        else:
+            # Using Previous State
+            if len(self.df.tic.unique()) > 1:
+                # for multiple stock
+                state = (
+                    [self.previous_state[0]]
+                    + self.data.close.values.tolist()
+                    + self.previous_state[
+                        (self.stock_dim + 1) : (self.stock_dim * 2 + 1)
+                    ]
+                    + sum(
+                        (
+                            self.data[tech].values.tolist()
+                            for tech in self.tech_indicator_list
+                        ),
+                        [],
+                    )
+                )
+            else:
+                # for single stock
+                state = (
+                    [self.previous_state[0]]
+                    + [self.data.close]
+                    + self.previous_state[
+                        (self.stock_dim + 1) : (self.stock_dim * 2 + 1)
+                    ]
+                    + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+                )
+        return state
+
+    def _update_state(self):
+        if len(self.df.tic.unique()) > 1:
+            self.data = self._get_multi_stock_data()
+            # for multiple stock
+            state = (
+                [self.state[0]]
+                + self.data.close.values.tolist()
+                + list(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
+                + sum(
+                    (
+                        self.data[tech].values.tolist()
+                        for tech in self.tech_indicator_list
+                    ),
+                    [],
+                )
+            )
+
+        else:
+            # for single stock
+            state = (
+                [self.state[0]]
+                + [self.data.close]
+                + list(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
+                + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+            )
+
+        return state
+
+    ############################## Custom Method to parse data for multi stock data
+    def _get_multi_stock_data(self):
+        _tickers = len(self.df.tic.unique())
+        return self.df.loc[ [i for i in range(
+            self.day * _tickers, self.day * _tickers + _tickers
+        )], : ]
+
+    def _get_date(self):
+        if len(self.df.tic.unique()) > 1:
+            date = self.data.date.unique()[0]
+        else:
+            date = self.data.date
+        return date
+
+    # add save_state_memory to preserve state in the trading process
+    def save_state_memory(self):
+        if len(self.df.tic.unique()) > 1:
+            # date and close price length must match actions length
+            date_list = self.date_memory[:-1]
+            df_date = pd.DataFrame(date_list)
+            df_date.columns = ["date"]
+
+            state_list = self.state_memory
+            df_states = pd.DataFrame(
+                state_list,
+                columns=[
+                    "cash",
+                    "Bitcoin_price",
+                    "Gold_price",
+                    "Bitcoin_num",
+                    "Gold_num",
+                    "Bitcoin_Disable",
+                    "Gold_Disable",
+                ],
+            )
+            df_states.index = df_date.date
+            # df_actions = pd.DataFrame({'date':date_list,'actions':action_list})
+        else:
+            date_list = self.date_memory[:-1]
+            state_list = self.state_memory
+            df_states = pd.DataFrame({"date": date_list, "states": state_list})
+        # print(df_states)
+        return df_states
+
+    def save_asset_memory(self):
+        date_list = self.date_memory
+        asset_list = self.asset_memory
+        # print(len(date_list))
+        # print(len(asset_list))
+        df_account_value = pd.DataFrame(
+            {"date": date_list, "account_value": asset_list}
+        )
+        return df_account_value
+
+    def save_action_memory(self):
+        if len(self.df.tic.unique()) > 1:
+            # date and close price length must match actions length
+            date_list = self.date_memory[:-1]
+            df_date = pd.DataFrame(date_list)
+            df_date.columns = ["date"]
+
+            action_list = self.actions_memory
+            df_actions = pd.DataFrame(action_list)
+            df_actions.columns = self.data.tic.values
+            df_actions.index = df_date.date
+            # df_actions = pd.DataFrame({'date':date_list,'actions':action_list})
+        else:
+            date_list = self.date_memory[:-1]
+            action_list = self.actions_memory
+            df_actions = pd.DataFrame({"date": date_list, "actions": action_list})
+        return df_actions
+
+    def _seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+    def get_sb_env(self):
+        e = DummyVecEnv([lambda: self])
+        obs = e.reset()
+        return e, obs
+
+
+# In[ ]:
+
+
+import os
+all_indicators = ["volume",	"macd", "boll_ub", "boll_lb", "rsi_30", "cci_30", "dx_30", "close_30_sma", "close_60_sma", "turbulence"]
+use_indicators = ["volume",	"macd", "boll_ub", "boll_lb", "rsi_30", "cci_30", "dx_30", "close_30_sma", "close_60_sma", "turbulence"]
+turbulence_thresold=100
+
+df = df[(df['date'] >= "2008-09-24") & (df['date'] <= "2022-01-01")]
+
+df.reset_index(drop=True, inplace=True)
+
+print(df)
+
+stock_dim = len(df["tic"].unique())
+print("stock_dim =", stock_dim)
+
+state_space = 1 + 2*stock_dim + stock_dim * len(use_indicators)
+print("state_space =", state_space)
+
+max_price = df['close'].max()
+initial_amount = 100000
+hmax = int(initial_amount / max_price)
+
+env = StockTradingEnv(
+    df=df,
+    stock_dim=stock_dim,
+    hmax=hmax,
+    initial_amount=initial_amount,
+    num_stock_shares=[0] * stock_dim,
+
+    # Verbose
+    make_plots=True,
+    print_verbosity=1,
+    treynor_rate_learn = 0.2,
+    drawdown_component_learn = 0.1,
+    diversification_component_learn = 0.1,
+    cost_component_learn = 0.1,
+    risk_component_learn = 0.2,
+    return_component_learn = 0.5,
+
+    # Transaction Cost
+    buy_cost_pct=[0.001] * stock_dim,
+    sell_cost_pct=[0.001] * stock_dim,
+
+    # Turbulence Thresold
+    turbulence_threshold=turbulence_thresold,
+
+    reward_scaling=1e-4,
+    tech_indicator_list=use_indicators,
+
+    # State Space: Portfolio Value + Holdings + Tech Indicators
+    state_space=state_space,
+
+    # Action Space
+    action_space=stock_dim,
+)
+
+os.makedirs("results", exist_ok=True) # set up folder for plots
+print(df)
+env
+
+
+# In[ ]:
+
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+
+import warnings
+warnings.filterwarnings("ignore")
+resume_training=True
+env.reset()
+vec_env = make_vec_env(lambda: Monitor(env, '/'), n_envs=1)
+
+if resume_training:
+    try:
+      model = PPO.load("resume", env=vec_env, verbose=1)
+      print("Resuming training...")
+    except:
+      model = PPO("MlpPolicy", env=vec_env, verbose=1)
+      print("Starting new training...")
+else:
+    model = PPO("MlpPolicy", env=vec_env, verbose=1)
+    print("Starting new training...")
+
+model.learn(total_timesteps=100_000)
+
+
+# In[ ]:
+
+
+get_ipython().system('pip install optuna')
+
+
+# In[ ]:
+
+
+import optuna
+import warnings
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.evaluation import evaluate_policy
+
+warnings.filterwarnings("ignore")
+
+# Initialize the environment
+#env = StockTradingEnv()  # Ensure this is correctly defined
+vec_env = make_vec_env(lambda: Monitor(env, '/'), n_envs=1)  # Wrap in VecEnv
+
+def optimize_agent(trial):
+    """Objective function for Optuna to optimize PPO hyperparameters."""
+
+    # Define the hyperparameter search space
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+    gamma = trial.suggest_float("gamma", 0.8, 0.999)
+    n_steps = trial.suggest_int("n_steps", 128, 2048, step=128)
+    batch_size = trial.suggest_int("batch_size", 32, 1024, step=64)
+    n_epochs = trial.suggest_int("n_epochs", 3, 20)
+    ent_coef = trial.suggest_float("ent_coef", 0.0, 0.1)
+    clip_range = trial.suggest_float("clip_range", 0.1, 0.4)
+    w_treynor = trial.suggest_float("treynor_rate_learn", 0.1, 5.0)  # More profit weight
+    w_drawdown = trial.suggest_float("drawdown_component_learn", 0.1, 5.0)  # Risk penalty weight
+    #w_diverse = trial.suggest_float("diversification_component_learn", 0.1, 5.0)  # Risk penalty weight
+    w_cost = trial.suggest_float("cost_component_learn", 0.1, 5.0)
+    w_risk = trial.suggest_float("risk_component_learn", 0.1, 6.0)
+    w_return = trial.suggest_float("return_component_learn", 0.1, 7.0)
+    """treynor_rate_learn = 0.2
+drawdown_component_learn = 0.1
+diversification_component_learn = 0.1
+cost_component_learn = 0.1
+risk_component_learn = 0.2
+return_component_learn = 0.5"""
+
+    # Ensure batch_size does not exceed n_steps
+
+    if batch_size > n_steps:
+        return float("-inf")
+
+    # Initialize the PPO model with suggested hyperparameters
+    env.set_reward_weights(w_treynor, w_drawdown, w_cost, w_risk, w_return)
+    model = PPO("MlpPolicy", vec_env, learning_rate=learning_rate, gamma=gamma,
+                n_steps=n_steps, batch_size=batch_size, n_epochs=n_epochs,
+                ent_coef=ent_coef, clip_range=clip_range, verbose=1)
+
+    # Train the model
+    model.learn(total_timesteps=100_000)
+
+    # Evaluate the model
+    mean_reward, _ = evaluate_policy(model, vec_env, n_eval_episodes=10)
+
+    return mean_reward  # Optuna will maximize this reward
+
+# Run Optuna optimization
+study = optuna.create_study(direction="maximize")
+study.optimize(optimize_agent, n_trials=15)
+
+# Print best hyperparameters
+print("Best hyperparameters:", study.best_params)
+
+
+# In[ ]:
+
+
+import optuna
+import warnings
+import numpy as np
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.evaluation import evaluate_policy
+
+warnings.filterwarnings("ignore")
+
+resume_training = True  # Set to True to resume training from 'resume.zip'
+
+# Initialize the environment
+#env = SingleStockTradingEnv()  # Ensure this is correctly defined
+
+vec_env = make_vec_env(lambda: Monitor(env, '/'), n_envs=1)  # Wrap in VecEnv
+
+def optimize_agent(trial):
+    """Objective function for Optuna to optimize PPO hyperparameters with mini-batch training and resumption."""
+
+    # Hyperparameter search space
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+    gamma = trial.suggest_float("gamma", 0.8, 0.999)
+    n_steps = trial.suggest_int("n_steps", 128, 2048, step=128)
+    batch_size = trial.suggest_int("batch_size", 32, min(n_steps, 1024), step=32)
+    n_epochs = trial.suggest_int("n_epochs", 3, 20)
+    ent_coef = trial.suggest_float("ent_coef", 0.0, 0.1)
+    clip_range = trial.suggest_float("clip_range", 0.1, 0.4)
+    w_treynor = trial.suggest_float("treynor_rate_learn", 0.1, 0.5)
+    w_drawdown = trial.suggest_float("drawdown_component_learn", 0.1, 0.5)
+    w_diverse = trial.suggest_float("diversification_component_learn", 0.1, 0.5)
+    w_cost = trial.suggest_float("cost_component_learn", 0.1, 0.5)
+    w_risk = trial.suggest_float("risk_component_learn", 0.1, 0.6)
+    w_return = trial.suggest_float("return_component_learn", 0.1, 0.7)
+
+    # Ensure batch_size does not exceed n_steps but it wont run the below if statement as batchsize is always <= n_steps
+    if batch_size > n_steps:
+        return float("-inf")
+
+    # Load model if resuming training
+    env.set_reward_weights(w_treynor, w_drawdown, w_diverse, w_cost, w_risk, w_return)
+
+    if resume_training:
+        try:
+            model = PPO.load("resume", env=vec_env, verbose=1)
+            print("Resuming training with previous model...")
+        except:
+            model = PPO("MlpPolicy", vec_env, learning_rate=learning_rate, gamma=gamma,
+                        n_steps=n_steps, batch_size=batch_size, n_epochs=n_epochs,
+                        ent_coef=ent_coef, clip_range=clip_range, verbose=1)
+            print("Previous model not found. Starting new training...")
+    else:
+        model = PPO("MlpPolicy", vec_env, learning_rate=learning_rate, gamma=gamma,
+                    n_steps=n_steps, batch_size=batch_size, n_epochs=n_epochs,
+                    ent_coef=ent_coef, clip_range=clip_range, verbose=1)
+        print("Starting new training...")
+
+    # Train the model
+    model.learn(total_timesteps=100_000)
+
+    # Save the trained model
+    model.save("resume")
+
+    # Evaluate the model
+    mean_reward, _ = evaluate_policy(model, vec_env, n_eval_episodes=10)
+
+    return mean_reward  # Optuna maximizes this reward
+
+# Run Optuna optimization
+study = optuna.create_study(direction="maximize")
+study.optimize(optimize_agent, n_trials=10)
+
+# Print best parameters
+print("Best hyperparameters:", study.best_params)
+
+
+# In[ ]:
+
+
+import optuna
+import warnings
+import numpy as np
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.evaluation import evaluate_policy
+
+warnings.filterwarnings("ignore")
+
+resume_training = True  # Set to True to resume training from 'resume.zip'
+
+# Define the Optuna objective function
+def optimize_agent(trial):
+    """Objective function for Optuna to optimize PPO hyperparameters with mini-batch training and resumption."""
+
+    # Tune PPO hyperparameters
+    learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)  # Adjusted range
+    gamma = trial.suggest_float("gamma", 0.8, 0.999)
+    n_steps = trial.suggest_int("n_steps", 128, 2048, step=128)
+    batch_size = min(trial.suggest_int("batch_size", 32, 1024, step=32), n_steps)  # Ensure batch_size <= n_steps
+    n_epochs = trial.suggest_int("n_epochs", 3, 20)
+    ent_coef = trial.suggest_float("ent_coef", 0.0, 0.1)
+    clip_range = trial.suggest_float("clip_range", 0.1, 0.4)
+
+    # Tune reward function weights (broader range)
+    w_treynor = trial.suggest_float("w_treynor", 0.01, 5.0)
+    w_drawdown = trial.suggest_float("w_drawdown", 0.01, 5.0)
+    w_diverse = trial.suggest_float("w_diverse", 0.01, 5.0)
+    w_cost = trial.suggest_float("w_cost", 0.01, 5.0)
+    w_risk = trial.suggest_float("w_risk", 0.01, 5.0)
+    w_return = trial.suggest_float("w_return", 0.01, 5.0)
+    env.reset()
+    env.set_reward_weights(w_treynor, w_drawdown, w_diverse, w_cost, w_risk, w_return)
+    vec_env = make_vec_env(lambda: Monitor(env, '/'), n_envs=1)
+
+    # Initialize environment (fresh instance per trial)
+    '''
+    print(f"w_treynor: {w_treynor}")
+    print(f"begin_total_asset: {self.asset_memory[0]:0.2f}")
+    print(f"end_total_asset: {end_total_asset:0.2f}")
+    print(f"total_reward: {tot_reward:0.2f}")
+    print(f"total_cost: {self.cost:0.2f}")
+    print(f"total_trades: {self.trades}")
+    print("=================================")
+    '''
+
+
+    # Load model if resuming training
+    if resume_training:
+        try:
+            model = PPO.load("resume", env=vec_env, verbose=1)
+            print("Resuming training with previous model...")
+        except:
+            model = PPO("MlpPolicy", vec_env, learning_rate=learning_rate, gamma=gamma,
+                        n_steps=n_steps, batch_size=batch_size, n_epochs=n_epochs,
+                        ent_coef=ent_coef, clip_range=clip_range, verbose=1)
+            print("Previous model not found. Starting new training...")
+    else:
+        model = PPO("MlpPolicy", vec_env, learning_rate=learning_rate, gamma=gamma,
+                    n_steps=n_steps, batch_size=batch_size, n_epochs=n_epochs,
+                    ent_coef=ent_coef, clip_range=clip_range, verbose=1)
+        print("Starting new training...")
+
+    # Train the model
+    model.learn(total_timesteps=100_000)
+
+    # Save the trained model
+    model.save("resume")
+
+    # Evaluate the model with more episodes
+    mean_reward, _ = evaluate_policy(model, vec_env, n_eval_episodes=20)  # Increased from 10 to 20
+
+    return mean_reward  # Optuna maximizes this reward
+
+# Run Optuna optimization
+study = optuna.create_study(direction="maximize")
+study.optimize(optimize_agent, n_trials=10)
+
+# Print best parameters
+print("Best hyperparameters:", study.best_params)
+
+
+# In[ ]:
+
+
+import warnings
+import numpy as np
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+
+warnings.filterwarnings("ignore")
+
+# Initialize the environment
+env = SingleStockTradingEnv()  # Ensure this is correctly defined
+vec_env = make_vec_env(lambda: Monitor(env, '/'), n_envs=1)  # Wrap in VecEnv
+
+# Define PPO hyperparameters for batch training
+learning_rate = 3e-4
+gamma = 0.99
+n_steps = 1024  # Collect 1024 steps before each update
+batch_size = 64  # Mini-batch size for updates
+n_epochs = 10  # Number of times each batch is used for training
+ent_coef = 0.01
+clip_range = 0.2
+
+# Load model if resuming training
+resume_training = True
+
+if resume_training:
+    try:
+        model = PPO.load("resume", env=vec_env, verbose=1)
+        print("Resuming training with previous model...")
+    except:
+        model = PPO("MlpPolicy", vec_env, learning_rate=learning_rate, gamma=gamma,
+                    n_steps=n_steps, batch_size=batch_size, n_epochs=n_epochs,
+                    ent_coef=ent_coef, clip_range=clip_range, verbose=1)
+        print("Previous model not found. Starting new training...")
+else:
+    model = PPO("MlpPolicy", vec_env, learning_rate=learning_rate, gamma=gamma,
+                n_steps=n_steps, batch_size=batch_size, n_epochs=n_epochs,
+                ent_coef=ent_coef, clip_range=clip_range, verbose=1)
+    print("Starting new training...")
+
+# Train the model using mini-batch training
+model.learn(total_timesteps=100_000)
+
+# Save the trained model
+model.save("resume")
+
+print("Training complete!")
