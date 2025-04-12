@@ -1,5 +1,6 @@
 streamlit
 gymnasium
+gym==0.26.2
 stable-baselines3
 pandas
 numpy
