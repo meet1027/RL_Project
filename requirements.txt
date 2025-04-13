@@ -1,4 +1,4 @@
-finrl==0.3.8
+finrl==0.3.7
 ray==2.44.1
 optuna==3.4.0
 pyfolio==0.9.2
