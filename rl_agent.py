@@ -1,77 +1,45 @@
-
-import numpy as np
-import pandas as pd
 from stable_baselines3 import PPO
-from trading_env import StockTradingEnv
-import warnings
-warnings.filterwarnings("ignore")
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.evaluation import evaluate_policy
+import optuna
 
-def initialize_env(df, initial_amount=100000):
-    """Initialize trading environment with validation"""
-    if not isinstance(df, pd.DataFrame):
-        raise ValueError("Input must be a pandas DataFrame")
-    
-    stock_dim = len(df["tic"].unique())
-    tech_indicators = ["volume", "macd", "boll_ub", "boll_lb", 
-                      "rsi_30", "cci_30", "dx_30", "close_30_sma", 
-                      "close_60_sma", "turbulence"]
-    
-    max_price = df['close'].max()
-    hmax = int(initial_amount / max_price) if max_price > 0 else 100
+class RLAgent:
+    def __init__(self, env):
+        self.env = env
+        self.model = None
 
-    return StockTradingEnv(
-        df=df,
-        stock_dim=stock_dim,
-        hmax=hmax,
-        initial_amount=initial_amount,
-        num_stock_shares=[0]*stock_dim,
-        buy_cost_pct=[0.001]*stock_dim,
-        sell_cost_pct=[0.001]*stock_dim,
-        state_space=1 + 2*stock_dim + stock_dim*len(tech_indicators),
-        action_space=stock_dim,
-        tech_indicator_list=tech_indicators
-    )
+    def train(self, total_timesteps=100_000):
+        vec_env = make_vec_env(lambda: Monitor(self.env, '/'), n_envs=1)
+        self.model = PPO("MlpPolicy", vec_env, verbose=1)
+        self.model.learn(total_timesteps=total_timesteps)
 
-def train_agent(env, timesteps=100000, model_save_path="ppo_trader"):
-    """Train PPO agent with error handling"""
-    try:
-        model = PPO("MlpPolicy", env, verbose=1,
-                    batch_size=256,
-                    n_steps=1024,
-                    n_epochs=10,
-                    gamma=0.99,
-                    learning_rate=3e-4)
-        
-        model.learn(total_timesteps=timesteps)
-        model.save(model_save_path)
-        return model
-    except Exception as e:
-        raise RuntimeError(f"Training failed: {str(e)}")
+    def optimize_hyperparameters(self, n_trials=10):
+        def objective(trial):
+            learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+            gamma = trial.suggest_float("gamma", 0.8, 0.999)
+            n_steps = trial.suggest_int("n_steps", 128, 2048, step=128)
+            batch_size = trial.suggest_int("batch_size", 32, 1024, step=64)
+            n_epochs = trial.suggest_int("n_epochs", 3, 20)
+            ent_coef = trial.suggest_float("ent_coef", 0.0, 0.1)
+            clip_range = trial.suggest_float("clip_range", 0.1, 0.4)
 
-def evaluate_agent(model_path, env):
-    """Evaluate trained agent with proper validation"""
-    try:
-        model = PPO.load(model_path.replace('.zip', ''), env=env)
-        obs = env.reset()
-        done = False
-        portfolio_values = []
-        
-        while not done:
-            action, _ = model.predict(obs)
-            obs, _, done, _ = env.step(action)
-            portfolio_values.append(env.state[0] + sum(
-                np.array(env.state[1:(env.stock_dim+1)]) * 
-                np.array(env.state[(env.stock_dim+1):(env.stock_dim*2+1)]))
+            vec_env = make_vec_env(lambda: Monitor(self.env, '/'), n_envs=1)
+            model = PPO(
+                "MlpPolicy", vec_env,
+                learning_rate=learning_rate,
+                gamma=gamma,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                n_epochs=n_epochs,
+                ent_coef=ent_coef,
+                clip_range=clip_range,
+                verbose=1
             )
-        return portfolio_values
-    except Exception as e:
-        raise RuntimeError(f"Evaluation failed: {str(e)}")
+            model.learn(total_timesteps=50_000)
+            mean_reward, _ = evaluate_policy(model, vec_env, n_eval_episodes=10)
+            return mean_reward
 
-def load_model(model_path, env):
-    """Safe model loader with version checking"""
-    try:
-        return PPO.load(model_path.replace('.zip', ''), env=env)
-    except ValueError as e:
-        raise ValueError(f"Model format error: {str(e)}")
-    except FileNotFoundError:
-        raise FileNotFoundError("Model file not found - check path and permissions")
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=n_trials)
+        return study.best_params
